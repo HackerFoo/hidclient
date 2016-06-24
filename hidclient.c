@@ -168,6 +168,8 @@ int		add_filedescriptors(fd_set*);
 int		parse_events(fd_set*,int);
 void		showhelp(void);
 void		onsignal(int);
+void	        muteevents (void);
+void	        unmuteevents (void);
 
 //***************** Data structures
 // Mouse HID report, as sent over the wire:
@@ -197,9 +199,12 @@ char		mousebuttons	 = 0;	// storage for button status
 char		modifierkeys	 = 0;	// and for shift/ctrl/alt... status
 char		pressedkey[8]	 = { 0, 0, 0, 0,  0, 0, 0, 0 };
 char		connectionok	 = 0;
+char		ignore	         = 0;
 uint32_t	sdphandle	 = 0;	// To be used to "unregister" on exit
 int		debugevents      = 0;	// bitmask for debugging event data
 
+int			onlyoneevdev = -1;// If restricted to using only one evdev
+int			mutex11 = 0;      // try to "mute" in x11?
 //***************** Implementation
 /* 
  * Taken from bluetooth library because of suspicious memory allocation
@@ -515,6 +520,7 @@ int	initevents ( int useonlyone, int mutex11 )
 	}
 	for ( i = j = 0; j < MAXEVDEVS; ++j )
 	{
+                if (j < 7) continue;
 		if ( ( useonlyone >= 0 ) && ( useonlyone != j ) ) { continue; }
 		sprintf ( buf, EVDEVNAME, j );
 		eventdevs[i] = open ( buf, O_RDONLY );
@@ -560,6 +566,50 @@ int	initevents ( int useonlyone, int mutex11 )
 	}
 	if ( xinlist != NULL ) { free ( xinlist ); }
 	return	i;
+}
+
+void	muteevents ( void )
+{
+	int	i;
+	char	buf[256];
+	for ( i = 0; i < MAXEVDEVS; ++i )
+	{
+		if ( eventdevs[i] >= 0 )
+		{
+			if ( x11handles[i] >= 0 )
+			{
+				sprintf ( buf, "xinput set-int-prop %d \"Device "\
+				"Enabled\" 8 0", x11handles[i] );
+				if ( system ( buf ) )
+				{
+					fprintf ( stderr, "Failed to x11-mute device %d.\n", i );
+				}
+			}
+		}
+	}
+	return;
+}
+
+void	unmuteevents ( void )
+{
+	int	i;
+	char	buf[256];
+	for ( i = 0; i < MAXEVDEVS; ++i )
+	{
+		if ( eventdevs[i] >= 0 )
+		{
+			if ( x11handles[i] >= 0 )
+			{
+				sprintf ( buf, "xinput set-int-prop %d \"Device "\
+				"Enabled\" 8 1", x11handles[i] );
+				if ( system ( buf ) )
+				{
+					fprintf ( stderr, "Failed to x11-unmute device %d.\n", i );
+				}
+			}
+		}
+	}
+	return;
 }
 
 void	closeevents ( void )
@@ -787,7 +837,7 @@ int	parse_events ( fd_set * efds, int sockdesc )
 				evmouse->axis_x =
 				evmouse->axis_y =
 				evmouse->axis_z = 0;
-				if ( ! connectionok )
+				if ( ! connectionok || ignore)
 					break;
 				j = send ( sockdesc, evmouse,
 					sizeof(struct hidrep_mouse_t),
@@ -802,7 +852,7 @@ int	parse_events ( fd_set * efds, int sockdesc )
 				// When pressed: abort connection
 				if ( inevent->value == 0 )
 				{
-				    if ( connectionok )
+				    if ( connectionok && !ignore )
 				    {
 					evkeyb->btcode=0xA1;
 					evkeyb->rep_id=REPORTID_KEYBD;
@@ -811,12 +861,12 @@ int	parse_events ( fd_set * efds, int sockdesc )
 					j = send ( sockdesc, evkeyb,
 					  sizeof(struct hidrep_keyb_t),
 					  MSG_NOSIGNAL );
-					close ( sockdesc );
 				    }
 				    // If also LCtrl+Alt pressed:
 				    // Terminate program
 				    if (( modifierkeys & 0x5 ) == 0x5 )
 				    {
+					close ( sockdesc );
 					return	-99;
 				    }
 				    return -1;
@@ -847,6 +897,7 @@ int	parse_events ( fd_set * efds, int sockdesc )
 					modifierkeys |= u;
 				}
 				evkeyb->modify = modifierkeys;
+                                if ( ! connectionok || ignore ) break;
 				j = send ( sockdesc, evkeyb,
 					sizeof(struct hidrep_keyb_t),
 					MSG_NOSIGNAL );
@@ -995,7 +1046,7 @@ int	parse_events ( fd_set * efds, int sockdesc )
 				}
 				memcpy ( evkeyb->key, pressedkey, 8 );
 				evkeyb->modify = modifierkeys;
-				if ( ! connectionok ) break;
+				if ( ! connectionok || ignore ) break;
 				j = send ( sockdesc, evkeyb,
 					sizeof(struct hidrep_keyb_t),
 					MSG_NOSIGNAL );
@@ -1031,7 +1082,7 @@ int	parse_events ( fd_set * efds, int sockdesc )
 				evmouse->axis_z =
 					( inevent->code >= ABS_Z ?
 					  inevent->value : 0 );
-				if ( ! connectionok ) break;
+				if ( ! connectionok || ignore ) break;
 				j = send ( sockdesc, evmouse,
 					sizeof(struct hidrep_mouse_t),
 					MSG_NOSIGNAL );
@@ -1071,8 +1122,6 @@ int	main ( int argc, char ** argv )
 	int			maxevdevfileno;
 	char			skipsdp = 0;	  // On request, disable SDPreg
 	struct timeval		tv;		  // Used for "select"
-	int			onlyoneevdev = -1;// If restricted to using only one evdev
-	int			mutex11 = 0;      // try to "mute" in x11?
 	char			*fifoname = NULL; // Filename for fifo, if applicable
 	// Parse command line
 	for ( i = 1; i < argc; ++i )
@@ -1295,10 +1344,16 @@ int	main ( int argc, char ** argv )
 			{
 				if ( 0 > ( j = parse_events ( &efds, sint ) ) )
 				{
+                                        ignore = !ignore;
+                                        if(ignore) {
+                                          unmuteevents();
+                                        } else {
+                                          muteevents();
+                                        }
 					// PAUSE pressed - close connection
-					connectionok = 0;
 					if ( j < -1 )
 					{	// LCtrl-LAlt-PAUSE - terminate
+                                                connectionok = 0;
 						close ( sint );
 						close ( sctl );
 						prepareshutdown = 1;
